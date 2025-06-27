@@ -30,6 +30,29 @@ logger = logging.getLogger(__name__)
 # Configure tqdm for better progress bars
 tqdm.pandas(desc="Processing")
 
+# Define categorical features
+CAT_COLS = [
+    'nationality', 'searchRoute', 'corporateTariffCode',
+    # Leg 0 segments 0-1
+    'legs0_segments0_aircraft_code', 'legs0_segments0_arrivalTo_airport_city_iata',
+    'legs0_segments0_arrivalTo_airport_iata', 'legs0_segments0_departureFrom_airport_iata',
+    'legs0_segments0_marketingCarrier_code', 'legs0_segments0_operatingCarrier_code',
+    'legs0_segments0_flightNumber',
+    'legs0_segments1_aircraft_code', 'legs0_segments1_arrivalTo_airport_city_iata',
+    'legs0_segments1_arrivalTo_airport_iata', 'legs0_segments1_departureFrom_airport_iata',
+    'legs0_segments1_marketingCarrier_code', 'legs0_segments1_operatingCarrier_code',
+    'legs0_segments1_flightNumber',
+    # Leg 1 segments 0-1
+    'legs1_segments0_aircraft_code', 'legs1_segments0_arrivalTo_airport_city_iata',
+    'legs1_segments0_arrivalTo_airport_iata', 'legs1_segments0_departureFrom_airport_iata',
+    'legs1_segments0_marketingCarrier_code', 'legs1_segments0_operatingCarrier_code',
+    'legs1_segments0_flightNumber',
+    'legs1_segments1_aircraft_code', 'legs1_segments1_arrivalTo_airport_city_iata',
+    'legs1_segments1_arrivalTo_airport_iata', 'legs1_segments1_departureFrom_airport_iata',
+    'legs1_segments1_marketingCarrier_code', 'legs1_segments1_operatingCarrier_code',
+    'legs1_segments1_flightNumber'
+]
+
 logger.info("=" * 80)
 logger.info("Starting XGBoost Ranker Baseline for FlightRank 2025")
 logger.info("=" * 80)
@@ -41,13 +64,15 @@ logger.info("=" * 80)
 # Cache configuration
 CACHE_DIR = Path("data_cache")
 CACHE_VERSION = "v2.2"  
-ENABLE_CACHE = True
+ENABLE_CACHE = False
 
 # Core run-time parameters
 RANDOM_STATE = 42
-N_JOBS = min(16, (os.cpu_count() or 16))  # fall back to 16 if None
+# Force use of all available CPU cores
+cpu_count = mp.cpu_count()
+N_JOBS = cpu_count  # Use all 112 cores
 target_ram_usage = 0.85
-TRAIN_SAMPLE_FRAC = 1.0
+TRAIN_SAMPLE_FRAC = 0.01 # Use a small sample for verification
 
 def get_cache_key(*args):
     """Generate a cache key from arguments."""
@@ -271,28 +296,6 @@ def convert_ranker_ids(train, test):
 
 train, test = convert_ranker_ids(train, test)
 
-cat_features = [
-    'nationality', 'searchRoute', 'corporateTariffCode',
-    # Leg 0 segments 0-1
-    'legs0_segments0_aircraft_code', 'legs0_segments0_arrivalTo_airport_city_iata',
-    'legs0_segments0_arrivalTo_airport_iata', 'legs0_segments0_departureFrom_airport_iata',
-    'legs0_segments0_marketingCarrier_code', 'legs0_segments0_operatingCarrier_code',
-    'legs0_segments0_flightNumber',
-    'legs0_segments1_aircraft_code', 'legs0_segments1_arrivalTo_airport_city_iata',
-    'legs0_segments1_arrivalTo_airport_iata', 'legs0_segments1_departureFrom_airport_iata',
-    'legs0_segments1_marketingCarrier_code', 'legs0_segments1_operatingCarrier_code',
-    'legs0_segments1_flightNumber',
-    # Leg 1 segments 0-1
-    'legs1_segments0_aircraft_code', 'legs1_segments0_arrivalTo_airport_city_iata',
-    'legs1_segments0_arrivalTo_airport_iata', 'legs1_segments0_departureFrom_airport_iata',
-    'legs1_segments0_marketingCarrier_code', 'legs1_segments0_operatingCarrier_code',
-    'legs1_segments0_flightNumber',
-    'legs1_segments1_aircraft_code', 'legs1_segments1_arrivalTo_airport_city_iata',
-    'legs1_segments1_arrivalTo_airport_iata', 'legs1_segments1_departureFrom_airport_iata',
-    'legs1_segments1_marketingCarrier_code', 'legs1_segments1_operatingCarrier_code',
-    'legs1_segments1_flightNumber'
-]
-
 def process_duration_chunk(chunk_data):
     """Process duration columns for a chunk of data"""
     chunk, dur_cols = chunk_data
@@ -302,13 +305,14 @@ def process_duration_chunk(chunk_data):
         mask = s.notna()
         out = np.zeros(len(s), dtype=float)
         if mask.any():
-            # Explicitly work with a string series to help type checker
-            string_s = s[mask].astype(str)
-            parts = string_s.str.split(':', expand=True)
-            out[mask] = (
-                pd.to_numeric(parts[0], errors="coerce").fillna(0).astype(float) * 60
-                + pd.to_numeric(parts[1], errors="coerce").fillna(0).astype(float)
-            )
+            # Use string accessor on the Series directly
+            parts = s[mask].astype(str).str.split(':', expand=True)
+            
+            # Convert parts to numeric, ensuring proper handling
+            hours = pd.to_numeric(parts.iloc[:, 0], errors="coerce").fillna(0)
+            minutes = pd.to_numeric(parts.iloc[:, 1], errors="coerce").fillna(0)
+            
+            out[mask] = (hours.astype(float) * 60 + minutes.astype(float))
         return out
     
     for col in dur_cols:
@@ -332,23 +336,25 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
         + [f"legs{l}_segments{s}_duration" for l in (0, 1) for s in (0, 1)]
     )
     
-    # High-performance parallel processing with all available cores
+    # Force maximum parallelism - use all available CPU cores
     memory_usage = psutil.virtual_memory().percent
     memory_limit = target_ram_usage * 100 - 5  # 5% buffer before reducing parallelism
     if memory_usage > memory_limit:
         # Only reduce parallelism if memory is critically high
-        effective_jobs = max(cpu_count // 4, N_JOBS // 2)
+        effective_jobs = max(cpu_count // 2, N_JOBS // 2)
         logger.warning(f"Critical memory usage ({memory_usage:.1f}%), reducing parallelism to {effective_jobs} jobs")
     else:
-        effective_jobs = N_JOBS
+        effective_jobs = N_JOBS  # Use all 112 cores
     
-    # Split dataframe into chunks for parallel processing
-    chunk_size = max(1000, len(df) // effective_jobs)
+    logger.info(f"Using {effective_jobs} cores for parallel processing")
+    
+    # Split dataframe into more chunks for better parallelization
+    chunk_size = max(500, len(df) // (effective_jobs * 2))  # Smaller chunks for better distribution
     chunks = [df.iloc[i:i+chunk_size].copy() for i in range(0, len(df), chunk_size)]
     chunk_data = [(chunk, dur_cols) for chunk in chunks]
     
     with ProcessPoolExecutor(max_workers=effective_jobs) as executor:
-        with tqdm(total=len(chunks), desc="Processing duration chunks") as pbar:
+        with tqdm(total=len(chunks), desc=f"Processing duration chunks on {effective_jobs} cores") as pbar:
             processed_chunks = []
             for result in executor.map(process_duration_chunk, chunk_data):
                 processed_chunks.append(result)
@@ -408,6 +414,16 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
         pbar.update(1)
         
         feat["has_return"] = (1 - feat["is_one_way"]).astype(int)
+        pbar.update(1)
+
+    logger.info("Creating 'days-out' feature...")
+    with tqdm(desc="Days-out feature", total=1) as pbar:
+        request_dt = pd.to_datetime(df['requestDate'], errors='coerce')
+        departure_dt = pd.to_datetime(df['legs0_departureAt'], errors='coerce')
+        
+        # Calculate the difference in days
+        days_out = (departure_dt - request_dt).dt.days
+        feat['days_out'] = days_out
         pbar.update(1)
 
     logger.info("Creating ranking features...")
@@ -539,9 +555,10 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
             direct_min_price = direct_groups.min()
             # Use .to_dict() to resolve potential map ambiguity for the linter
             min_price_map = direct_min_price.to_dict()
+            # Use a lambda to ensure mapping is correctly interpreted
             feat["is_direct_cheapest"] = (
                 df["_is_direct"] & 
-                (df["totalPrice"] == df["ranker_id"].map(min_price_map))
+                (df["totalPrice"] == df["ranker_id"].map(lambda r: min_price_map.get(r)))
             ).astype(int)
         else:
             feat["is_direct_cheapest"] = 0
@@ -576,6 +593,13 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
         feat["cabin_class_diff"] = (
             df["legs0_segments0_cabinClass"].fillna(0) - df["legs1_segments0_cabinClass"].fillna(0)
         )
+        pbar.update(1)
+
+    logger.info("Creating interaction features...")
+    with tqdm(desc="Interaction features", total=2) as pbar:
+        feat["price_per_dur"] = df["totalPrice"] / (df["total_duration"] + 1)
+        pbar.update(1)
+        feat["policy_violation"] = (~feat["has_access_tp"].astype(bool)).astype(int) * feat["has_return"]
         pbar.update(1)
 
     logger.info("Merging engineered features...")
@@ -619,28 +643,6 @@ else:
     # Cache the processed features
     save_to_cache((train, test), cache_key, "features")
 
-# Categorical features
-cat_features = [
-    'nationality', 'searchRoute', 'corporateTariffCode',
-    # Leg 0 segments 0-1
-    'legs0_segments0_aircraft_code', 'legs0_segments0_arrivalTo_airport_city_iata',
-    'legs0_segments0_arrivalTo_airport_iata', 'legs0_segments0_departureFrom_airport_iata',
-    'legs0_segments0_marketingCarrier_code', 'legs0_segments0_operatingCarrier_code',
-    'legs0_segments0_flightNumber',
-    'legs0_segments1_aircraft_code', 'legs0_segments1_arrivalTo_airport_city_iata',
-    'legs0_segments1_arrivalTo_airport_iata', 'legs0_segments1_departureFrom_airport_iata',
-    'legs0_segments1_marketingCarrier_code', 'legs0_segments1_operatingCarrier_code',
-    'legs0_segments1_flightNumber',
-    # Leg 1 segments 0-1
-    'legs1_segments0_aircraft_code', 'legs1_segments0_arrivalTo_airport_city_iata',
-    'legs1_segments0_arrivalTo_airport_iata', 'legs1_segments0_departureFrom_airport_iata',
-    'legs1_segments0_marketingCarrier_code', 'legs1_segments0_operatingCarrier_code',
-    'legs1_segments0_flightNumber',
-    'legs1_segments1_aircraft_code', 'legs1_segments1_arrivalTo_airport_city_iata',
-    'legs1_segments1_arrivalTo_airport_iata', 'legs1_segments1_departureFrom_airport_iata',
-    'legs1_segments1_marketingCarrier_code', 'legs1_segments1_operatingCarrier_code',
-    'legs1_segments1_flightNumber'
-]
 
 logger.info("Defining columns to exclude...")
 # Columns to exclude (uninformative or problematic)
@@ -670,7 +672,7 @@ for leg in [0, 1]:
             exclude_cols.append(f'legs{leg}_segments{seg}_{suffix}')
 
 feature_cols = [col for col in train.columns if col not in exclude_cols]
-cat_features_final = [col for col in cat_features if col in feature_cols]
+cat_features_final = [col for col in CAT_COLS if col in feature_cols]
 
 logger.info(f"Using {len(feature_cols)} features ({len(cat_features_final)} categorical)")
 
@@ -781,7 +783,7 @@ def prepare_xgboost_data(X_tr, X_val, y_tr, y_val, groups_tr, groups_val, X_test
     X_val_xgb = X_val.copy()
     X_test_xgb = X_test.copy()
 
-    # Label encode categorical features in parallel
+    # Label encode categorical features in parallel using ALL cores
     logger.info("Label encoding categorical features...")
     
     # Prepare arguments for parallel processing
@@ -790,9 +792,9 @@ def prepare_xgboost_data(X_tr, X_val, y_tr, y_val, groups_tr, groups_val, X_test
         if col in X_tr_xgb.columns:
             encoding_args.append((col, X_tr_xgb[col], X_val_xgb[col], X_test_xgb[col]))
     
-    # Process in parallel with optimized batch submission
+    # Process in parallel with maximum parallelization - use all 112 cores
     with ProcessPoolExecutor(max_workers=N_JOBS) as executor:
-        with tqdm(total=len(encoding_args), desc="Encoding categorical features") as pbar:
+        with tqdm(total=len(encoding_args), desc=f"Encoding categorical features on {N_JOBS} cores") as pbar:
             # Submit all jobs at once for better parallelization
             futures = {executor.submit(encode_categorical_column, args): args[0] for args in encoding_args}
             for future in as_completed(futures):
@@ -822,7 +824,7 @@ def prepare_xgboost_data(X_tr, X_val, y_tr, y_val, groups_tr, groups_val, X_test
 # Perform 5-fold cross-validation
 folds = perform_train_val_split(X_train, y_train, groups_train, train)
 
-# XGBoost parameters from the original high-performing notebook
+# XGBoost parameters with all cores configured
 xgb_params = {
     'objective': 'rank:pairwise',
     'eval_metric': 'ndcg@3',
@@ -833,11 +835,12 @@ xgb_params = {
     'lambda': 10.0,
     'learning_rate': 0.05,
     'seed': RANDOM_STATE,
-    'n_jobs': N_JOBS,
+    'n_jobs': N_JOBS, 
     'tree_method': 'hist'  # Keep hist for performance, it's a safe optimization
 }
 
 logger.info(f"XGBoost parameters: {xgb_params}")
+logger.info(f"XGBoost will use {N_JOBS} cores for training")
 
 # Convert scores to probabilities using sigmoid
 def sigmoid(x):

@@ -2,3 +2,7 @@ kaggle/input/
 data_cache/
 submission.csv
 training_log.log
+.roo/
+processed_train.parquet
+context.md
+tasks.md
