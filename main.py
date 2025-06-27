@@ -15,6 +15,7 @@ import os
 import pickle
 import hashlib
 from pathlib import Path
+import category_encoders as ce
 
 # Set up logging with more detailed formatting
 logging.basicConfig(
@@ -56,11 +57,6 @@ CAT_COLS = [
 logger.info("=" * 80)
 logger.info("Starting XGBoost Ranker Baseline for FlightRank 2025")
 logger.info("=" * 80)
-
-# -----------------------------------------------------------------------------
-#  Early configuration (defined BEFORE first use)
-# -----------------------------------------------------------------------------
-
 # Cache configuration
 CACHE_DIR = Path("data_cache")
 CACHE_VERSION = "v2.2"  
@@ -68,11 +64,10 @@ ENABLE_CACHE = False
 
 # Core run-time parameters
 RANDOM_STATE = 42
-# Force use of all available CPU cores
 cpu_count = mp.cpu_count()
-N_JOBS = cpu_count  # Use all 112 cores
+N_JOBS = cpu_count  
 target_ram_usage = 0.85
-TRAIN_SAMPLE_FRAC = 0.01 # Use a small sample for verification
+TRAIN_SAMPLE_FRAC = 1.0
 
 def get_cache_key(*args):
     """Generate a cache key from arguments."""
@@ -305,12 +300,13 @@ def process_duration_chunk(chunk_data):
         mask = s.notna()
         out = np.zeros(len(s), dtype=float)
         if mask.any():
-            # Use string accessor on the Series directly
-            parts = s[mask].astype(str).str.split(':', expand=True)
+            # Use string accessor on the Series directly, which is more robust
+            s_str = s[mask].astype(str)
+            parts = s_str.str.split(':', expand=True)
             
             # Convert parts to numeric, ensuring proper handling
-            hours = pd.to_numeric(parts.iloc[:, 0], errors="coerce").fillna(0)
-            minutes = pd.to_numeric(parts.iloc[:, 1], errors="coerce").fillna(0)
+            hours = pd.to_numeric(parts[0], errors="coerce").fillna(0)
+            minutes = pd.to_numeric(parts[1], errors="coerce").fillna(0)
             
             out[mask] = (hours.astype(float) * 60 + minutes.astype(float))
         return out
@@ -751,19 +747,6 @@ def perform_train_val_split(X_train, y_train, groups_train, train_df):
 
 from sklearn.model_selection import StratifiedGroupKFold
 
-def encode_categorical_column(args):
-    col, X_tr_col, X_val_col, X_test_col = args
-    
-    # Create a mapping from all data
-    unique_vals = pd.concat([X_tr_col, X_val_col, X_test_col]).unique()
-    mapping = {val: idx for idx, val in enumerate(unique_vals)}
-    
-    encoded_tr = X_tr_col.map(mapping).fillna(-1).astype(int)
-    encoded_val = X_val_col.map(mapping).fillna(-1).astype(int)
-    encoded_test = X_test_col.map(mapping).fillna(-1).astype(int)
-    
-    return col, encoded_tr, encoded_val, encoded_test
-
 # (Inside the main block, after loading and preparing data)
 
 # Loop through each fold for training and evaluation
@@ -775,34 +758,12 @@ fold_hit_rates = []
 # Define helper functions for the CV loop
 
 @timer
-def prepare_xgboost_data(X_tr, X_val, y_tr, y_val, groups_tr, groups_val, X_test, cat_features_final):
-    """Prepare data for XGBoost with parallel label encoding"""
+def prepare_xgboost_data(X_tr, X_val, y_tr, y_val, groups_tr, groups_val):
+    """Prepare data for XGBoost DMatrix creation."""
     logger.info("Preparing data for XGBoost...")
     
     X_tr_xgb = X_tr.copy()
     X_val_xgb = X_val.copy()
-    X_test_xgb = X_test.copy()
-
-    # Label encode categorical features in parallel using ALL cores
-    logger.info("Label encoding categorical features...")
-    
-    # Prepare arguments for parallel processing
-    encoding_args = []
-    for col in cat_features_final:
-        if col in X_tr_xgb.columns:
-            encoding_args.append((col, X_tr_xgb[col], X_val_xgb[col], X_test_xgb[col]))
-    
-    # Process in parallel with maximum parallelization - use all 112 cores
-    with ProcessPoolExecutor(max_workers=N_JOBS) as executor:
-        with tqdm(total=len(encoding_args), desc=f"Encoding categorical features on {N_JOBS} cores") as pbar:
-            # Submit all jobs at once for better parallelization
-            futures = {executor.submit(encode_categorical_column, args): args[0] for args in encoding_args}
-            for future in as_completed(futures):
-                col, encoded_tr, encoded_val, encoded_test = future.result()
-                X_tr_xgb[col] = encoded_tr
-                X_val_xgb[col] = encoded_val
-                X_test_xgb[col] = encoded_test
-                pbar.update(1)
     
     # Create group sizes for XGBoost
     group_sizes_tr = groups_tr.value_counts().sort_index().values
@@ -908,18 +869,23 @@ for fold_num, (train_idx, val_idx) in enumerate(folds):
         logger.info("Garbage collection completed")
         monitor_memory()
     
-    # Split data for this fold
-    X_tr = X_train.iloc[train_idx]
-    X_val = X_train.iloc[val_idx]
-    y_tr = y_train.iloc[train_idx]
-    y_val = y_train.iloc[val_idx]
-    groups_tr = groups_train.iloc[train_idx]
-    groups_val = groups_train.iloc[val_idx]
+    # Split data for this fold, resetting indices to prevent alignment issues
+    X_tr = X_train.iloc[train_idx].reset_index(drop=True)
+    X_val = X_train.iloc[val_idx].reset_index(drop=True)
+    y_tr = y_train.iloc[train_idx].reset_index(drop=True)
+    y_val = y_train.iloc[val_idx].reset_index(drop=True)
+    groups_tr = groups_train.iloc[train_idx].reset_index(drop=True)
+    groups_val = groups_train.iloc[val_idx].reset_index(drop=True)
     
     logger.info(f"Fold {fold_num+1}: Train size={len(X_tr)}, Val size={len(X_val)}")
-    
+
+    # Apply Target Encoding for this fold
+    logger.info(f"Applying Target Encoding for Fold {fold_num+1}...")
+    target_encoder = ce.TargetEncoder(cols=cat_features_final, handle_unknown='value', handle_missing='value')
+    X_tr[cat_features_final] = target_encoder.fit_transform(X_tr[cat_features_final], y_tr)
+    X_val[cat_features_final] = target_encoder.transform(X_val[cat_features_final])
     # Prepare XGBoost data for this fold
-    dtrain, dval, y_val_filtered, groups_val_filtered = prepare_xgboost_data(X_tr, X_val, y_tr, y_val, groups_tr, groups_val, X_test, cat_features_final)
+    dtrain, dval, y_val_filtered, groups_val_filtered = prepare_xgboost_data(X_tr, X_val, y_tr, y_val, groups_tr, groups_val)
     
     # Train model for this fold
     logger.info(f"Training XGBoost model for Fold {fold_num+1}...")
@@ -973,25 +939,14 @@ print(f"Worst fold HitRate@3: {np.min(fold_hit_rates):.4f}")
 # Train final model on full data for test predictions
 logger.info("\nTraining final model on full training data...")
 
-# 1. Encode categorical features for the full training and test sets
-logger.info("Label encoding categorical features for final model...")
+# 1. Encode categorical features for the full training and test sets using TargetEncoder
+logger.info("Target encoding categorical features for final model...")
 X_train_xgb_final = X_train.copy()
 X_test_xgb_final = X_test.copy()
 
-encoding_args = []
-for col in cat_features_final:
-    if col in X_train_xgb_final.columns:
-        # For final model, val set is empty.
-        encoding_args.append((col, X_train_xgb_final[col], pd.Series(dtype='object'), X_test_xgb_final[col]))
-
-with ProcessPoolExecutor(max_workers=N_JOBS) as executor:
-    with tqdm(total=len(encoding_args), desc="Encoding final categorical features") as pbar:
-        futures = {executor.submit(encode_categorical_column, args): args[0] for args in encoding_args}
-        for future in as_completed(futures):
-            col, encoded_tr, _, encoded_test = future.result()
-            X_train_xgb_final[col] = encoded_tr
-            X_test_xgb_final[col] = encoded_test
-            pbar.update(1)
+final_target_encoder = ce.TargetEncoder(cols=cat_features_final, handle_unknown='value', handle_missing='value')
+X_train_xgb_final[cat_features_final] = final_target_encoder.fit_transform(X_train_xgb_final[cat_features_final], y_train)
+X_test_xgb_final[cat_features_final] = final_target_encoder.transform(X_test_xgb_final[cat_features_final])
 
 # 2. Create the final DMatrix for training
 logger.info("Creating final XGBoost DMatrix for training...")
