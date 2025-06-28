@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import logging
 from datetime import datetime
 import xgboost as xgb
+import lightgbm as lgb
 from tqdm import tqdm
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
@@ -16,6 +17,10 @@ import pickle
 import hashlib
 from pathlib import Path
 import category_encoders as ce
+
+# Import new modules
+from config import MODEL_TO_RUN, xgb_params, lgb_params, RANDOM_STATE
+from models import train_xgb_model, train_lgb_model
 
 # Set up logging with more detailed formatting
 logging.basicConfig(
@@ -33,7 +38,7 @@ tqdm.pandas(desc="Processing")
 
 # Define categorical features
 CAT_COLS = [
-    'nationality', 'searchRoute', 'corporateTariffCode',
+    'nationality', 'searchRoute', 'corporateTariffCode', 'bySelf', 'sex', 'companyID',
     # Leg 0 segments 0-1
     'legs0_segments0_aircraft_code', 'legs0_segments0_arrivalTo_airport_city_iata',
     'legs0_segments0_arrivalTo_airport_iata', 'legs0_segments0_departureFrom_airport_iata',
@@ -59,13 +64,12 @@ logger.info("Starting XGBoost Ranker Baseline for FlightRank 2025")
 logger.info("=" * 80)
 # Cache configuration
 CACHE_DIR = Path("data_cache")
-CACHE_VERSION = "v2.2"  
-ENABLE_CACHE = False
+CACHE_VERSION = "v2.3"  
+ENABLE_CACHE = True
 
 # Core run-time parameters
-RANDOM_STATE = 42
 cpu_count = mp.cpu_count()
-N_JOBS = cpu_count  
+N_JOBS = cpu_count
 target_ram_usage = 0.85
 TRAIN_SAMPLE_FRAC = 1.0
 
@@ -122,8 +126,7 @@ def clear_cache():
         logger.info("Cache cleared")
 
 # Global parameters with memory management
-TRAIN_SAMPLE_FRAC = 1.0  # Sample 100% of data for robust training
-RANDOM_STATE = 42
+TRAIN_SAMPLE_FRAC = 1.0  # Sample 10% of data for robust training
 
 # Dynamic high-performance configuration
 total_ram_gb = psutil.virtual_memory().total / (1024**3)
@@ -399,6 +402,10 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
 
     feat["total_segments"] = feat["n_segments_leg0"] + feat["n_segments_leg1"]
 
+    # High-impact features from notebook
+    mc_exists = [f'legs{l}_segments{s}_marketingCarrier_code' for l in (0, 1) for s in range(4) if f'legs{l}_segments{s}_marketingCarrier_code' in df.columns]
+    feat["l0_seg"] = df[mc_exists].notna().sum(axis=1)
+
     logger.info("Detecting trip types...")
     with tqdm(desc="Trip types", total=2) as pbar:
         # Fix trip type detection
@@ -604,6 +611,10 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
         df = pd.concat([df, pd.DataFrame(feat, index=df.index)], axis=1)
         pbar.update(100)
 
+    # is_min_segments feature
+    grp = df.groupby("ranker_id")["l0_seg"]
+    df["is_min_segments"] = (df["l0_seg"] == grp.transform("min")).astype(int)
+
     logger.info("Handling NaN values...")
     # Final NaN handling
     numeric_cols = df.select_dtypes(include="number").columns
@@ -648,7 +659,7 @@ exclude_cols = [
     'miniRules0_percentage', 'miniRules1_percentage',  # >90% missing
     'frequentFlyer',  # Already processed
     # Exclude constant or near-constant columns
-    'bySelf', 'pricingInfo_passengerCount',
+    'pricingInfo_passengerCount',
     # Exclude baggageAllowance_weightMeasurementType columns (likely constant)
     'legs0_segments0_baggageAllowance_weightMeasurementType',
     'legs0_segments1_baggageAllowance_weightMeasurementType',
@@ -745,8 +756,6 @@ def perform_train_val_split(X_train, y_train, groups_train, train_df):
         
     return folds
 
-from sklearn.model_selection import StratifiedGroupKFold
-
 # (Inside the main block, after loading and preparing data)
 
 # Loop through each fold for training and evaluation
@@ -755,53 +764,20 @@ all_val_true = []
 all_val_groups = []
 fold_hit_rates = []
 
-# Define helper functions for the CV loop
-
-@timer
-def prepare_xgboost_data(X_tr, X_val, y_tr, y_val, groups_tr, groups_val):
-    """Prepare data for XGBoost DMatrix creation."""
-    logger.info("Preparing data for XGBoost...")
-    
-    X_tr_xgb = X_tr.copy()
-    X_val_xgb = X_val.copy()
-    
-    # Create group sizes for XGBoost
-    group_sizes_tr = groups_tr.value_counts().sort_index().values
-    group_sizes_val = groups_val.value_counts().sort_index().values
-
-    # -------------------------------------------------------------
-    # STEP 2: Build DMatrix objects
-    # -------------------------------------------------------------
-    logger.info("Creating XGBoost DMatrix objects…")
-
-    def create_train_dmatrix():
-        return xgb.DMatrix(X_tr_xgb, label=y_tr, group=group_sizes_tr)
-
-    def create_val_dmatrix():
-        return xgb.DMatrix(X_val_xgb, label=y_val, group=group_sizes_val)
-
-    return create_train_dmatrix(), create_val_dmatrix(), y_val, groups_val
-
 # Perform 5-fold cross-validation
 folds = perform_train_val_split(X_train, y_train, groups_train, train)
 
-# XGBoost parameters with all cores configured
-xgb_params = {
-    'objective': 'rank:pairwise',
-    'eval_metric': 'ndcg@3',
-    'max_depth': 8,
-    'min_child_weight': 10,
-    'subsample': 0.8,
-    'colsample_bytree': 0.8,
-    'lambda': 10.0,
-    'learning_rate': 0.05,
-    'seed': RANDOM_STATE,
-    'n_jobs': N_JOBS, 
-    'tree_method': 'hist'  # Keep hist for performance, it's a safe optimization
-}
-
-logger.info(f"XGBoost parameters: {xgb_params}")
-logger.info(f"XGBoost will use {N_JOBS} cores for training")
+# Set model parameters based on config
+if MODEL_TO_RUN == 'xgb':
+    model_params = xgb_params
+    # Add n_jobs to xgb_params dynamically
+    model_params['n_jobs'] = N_JOBS
+    logger.info(f"Using XGBoost model with params: {model_params}")
+elif MODEL_TO_RUN == 'lgb':
+    model_params = lgb_params
+    logger.info(f"Using LightGBM model with params: {model_params}")
+else:
+    raise ValueError(f"Unknown model: {MODEL_TO_RUN}")
 
 # Convert scores to probabilities using sigmoid
 def sigmoid(x):
@@ -884,40 +860,29 @@ for fold_num, (train_idx, val_idx) in enumerate(folds):
     target_encoder = ce.TargetEncoder(cols=cat_features_final, handle_unknown='value', handle_missing='value')
     X_tr[cat_features_final] = target_encoder.fit_transform(X_tr[cat_features_final], y_tr)
     X_val[cat_features_final] = target_encoder.transform(X_val[cat_features_final])
-    # Prepare XGBoost data for this fold
-    dtrain, dval, y_val_filtered, groups_val_filtered = prepare_xgboost_data(X_tr, X_val, y_tr, y_val, groups_tr, groups_val)
-    
-    # Train model for this fold
-    logger.info(f"Training XGBoost model for Fold {fold_num+1}...")
-    start_time = datetime.now()
-    fold_model = xgb.train(
-        xgb_params,
-        dtrain,
-        num_boost_round=1500,
-        evals=[(dtrain, 'train'), (dval, 'val')],
-        early_stopping_rounds=100,
-        verbose_eval=False  # Reduce verbosity during CV
-    )
-    training_time = datetime.now() - start_time
-    logger.info(f"Fold {fold_num+1} training completed in {training_time}")
-    
-    # Make predictions for this fold
-    fold_val_preds = fold_model.predict(dval)
-    
+    # Train model based on the configuration
+    if MODEL_TO_RUN == 'xgb':
+        fold_model, fold_val_preds = train_xgb_model(
+            X_tr, y_tr, X_val, y_val, groups_tr, groups_val, model_params
+        )
+    elif MODEL_TO_RUN == 'lgb':
+        fold_model, fold_val_preds = train_lgb_model(
+            X_tr, y_tr, X_val, y_val, groups_tr, groups_val, model_params, cat_features_final
+        )
+
     # Evaluate this fold
     fold_hr3, fold_logloss, fold_acc = evaluate_model_fold(
-        y_val_filtered, fold_val_preds, groups_val_filtered, fold_num
+        y_val, fold_val_preds, groups_val, fold_num
     )
     
     # Store results
     all_val_preds.extend(fold_val_preds)
-    all_val_true.extend(y_val_filtered)
-    all_val_groups.extend(groups_val_filtered)
+    all_val_true.extend(y_val)
+    all_val_groups.extend(groups_val)
     fold_hit_rates.append(fold_hr3)
     fold_models.append(fold_model)
     
     # Memory cleanup after each fold
-    del dtrain, dval, fold_val_preds
     import gc
     gc.collect()
     logger.info(f"Fold {fold_num+1} cleanup completed")
@@ -937,50 +902,61 @@ print(f"Best fold HitRate@3: {np.max(fold_hit_rates):.4f}")
 print(f"Worst fold HitRate@3: {np.min(fold_hit_rates):.4f}")
 
 # Train final model on full data for test predictions
-logger.info("\nTraining final model on full training data...")
+logger.info(f"\nTraining final {MODEL_TO_RUN.upper()} model on full training data...")
 
 # 1. Encode categorical features for the full training and test sets using TargetEncoder
 logger.info("Target encoding categorical features for final model...")
-X_train_xgb_final = X_train.copy()
-X_test_xgb_final = X_test.copy()
+X_train_final = X_train.copy()
+X_test_final = X_test.copy()
 
 final_target_encoder = ce.TargetEncoder(cols=cat_features_final, handle_unknown='value', handle_missing='value')
-X_train_xgb_final[cat_features_final] = final_target_encoder.fit_transform(X_train_xgb_final[cat_features_final], y_train)
-X_test_xgb_final[cat_features_final] = final_target_encoder.transform(X_test_xgb_final[cat_features_final])
+X_train_final[cat_features_final] = final_target_encoder.fit_transform(X_train_final[cat_features_final], y_train)
+X_test_final[cat_features_final] = final_target_encoder.transform(X_test_final[cat_features_final])
 
-# 2. Create the final DMatrix for training
-logger.info("Creating final XGBoost DMatrix for training...")
-group_sizes_train_final = groups_train.value_counts().sort_index().values
-dtrain_final = xgb.DMatrix(X_train_xgb_final, label=y_train, group=group_sizes_train_final)
-
-# 3. Train the final model
-# Use the mean of best performing parameters from CV
+# 2. Train the final model
 best_iteration = int(np.mean([model.best_iteration for model in fold_models]))
 logger.info(f"Training final model for {best_iteration} rounds...")
-final_model = xgb.train(
-    xgb_params,
-    dtrain_final,
-    num_boost_round=best_iteration,
-    verbose_eval=50
-)
+
+if MODEL_TO_RUN == 'xgb':
+    group_sizes_train_final = groups_train.value_counts().sort_index().values
+    dtrain_final = xgb.DMatrix(X_train_final, label=y_train, group=group_sizes_train_final)
+    final_model = xgb.train(
+        model_params,
+        dtrain_final,
+        num_boost_round=best_iteration,
+        verbose_eval=50
+    )
+elif MODEL_TO_RUN == 'lgb':
+    group_sizes_train_final = groups_train.value_counts().sort_index()
+    dtrain_final = lgb.Dataset(
+        X_train_final,
+        label=y_train,
+        group=group_sizes_train_final,
+        categorical_feature=cat_features_final
+    )
+    final_model = lgb.train(
+        model_params,
+        dtrain_final,
+        num_boost_round=best_iteration,
+        callbacks=[lgb.log_evaluation(period=50)]
+    )
 
 # Generate test predictions with final model
 @timer
-def generate_test_predictions(final_model, X_test_xgb_final, test_df):
+def generate_test_predictions(final_model, X_test_final, test_df):
     """Generate predictions for test set"""
     logger.info("Generating test predictions...")
     
-    with tqdm(desc="Test predictions", total=3) as pbar:
+    if MODEL_TO_RUN == 'xgb':
         group_sizes_test = test_df.groupby('ranker_id').size().values
-        pbar.update(1)
-        dtest = xgb.DMatrix(X_test_xgb_final, group=group_sizes_test)
-        pbar.update(1)
+        dtest = xgb.DMatrix(X_test_final, group=group_sizes_test)
         test_preds = final_model.predict(dtest)
-        pbar.update(1)
-    
+    elif MODEL_TO_RUN == 'lgb':
+        test_preds = final_model.predict(X_test_final, num_iteration=final_model.best_iteration)
+
     return test_preds
 
-test_preds = generate_test_predictions(final_model, X_test_xgb_final, test)
+test_preds = generate_test_predictions(final_model, X_test_final, test)
 
 @timer
 def create_submission(test_df, test_preds):
@@ -1006,14 +982,21 @@ def create_submission(test_df, test_preds):
 submission = create_submission(test, test_preds)
 
 # Display feature importance from final model
-xgb_importance = final_model.get_score(importance_type='gain')
-xgb_importance_df = pd.DataFrame([
-    {'feature': k, 'xgb_importance': v} 
-    for k, v in xgb_importance.items()
-]).sort_values('xgb_importance', ascending=False)
+if MODEL_TO_RUN == 'xgb':
+    importance = final_model.get_score(importance_type='gain')
+    importance_df = pd.DataFrame([
+        {'feature': k, 'importance': v}
+        for k, v in importance.items()
+    ]).sort_values('importance', ascending=False)
+elif MODEL_TO_RUN == 'lgb':
+    importance = final_model.feature_importance(importance_type='gain')
+    importance_df = pd.DataFrame({
+        'feature': final_model.feature_name(),
+        'importance': importance
+    }).sort_values('importance', ascending=False)
 
 logger.info("Top 30 most important features:")
-print(xgb_importance_df.iloc[:30].to_string())
+print(importance_df.iloc[:30].to_string())
 
 logger.info("=" * 80)
 logger.info("5-fold Cross-Validation pipeline completed successfully!")
