@@ -1,6 +1,7 @@
 import xgboost as xgb
 import lightgbm as lgb
 import pandas as pd
+import polars as pl
 from tqdm import tqdm
 import logging
 from datetime import datetime
@@ -10,11 +11,28 @@ logger = logging.getLogger(__name__)
 def train_xgb_model(X_tr, y_tr, X_val, y_val, groups_tr, groups_val, model_params):
     """
     Trains an XGBoost model and returns the model and validation predictions.
+    Accepts both Polars and Pandas DataFrames, converts to Pandas for XGBoost compatibility.
     """
     logger.info("Preparing data for XGBoost...")
     
-    X_tr_xgb = X_tr.copy()
-    X_val_xgb = X_val.copy()
+    if isinstance(X_tr, pl.DataFrame):
+        X_tr_xgb = X_tr.to_pandas()
+    else:
+        X_tr_xgb = X_tr.copy()
+        
+    if isinstance(X_val, pl.DataFrame):
+        X_val_xgb = X_val.to_pandas()
+    else:
+        X_val_xgb = X_val.copy()
+    
+    if isinstance(y_tr, pl.Series):
+        y_tr = y_tr.to_pandas()
+    if isinstance(y_val, pl.Series):
+        y_val = y_val.to_pandas()
+    if isinstance(groups_tr, pl.Series):
+        groups_tr = groups_tr.to_pandas()
+    if isinstance(groups_val, pl.Series):
+        groups_val = groups_val.to_pandas()
     
     # Create group sizes for XGBoost
     group_sizes_tr = groups_tr.value_counts().sort_index().values

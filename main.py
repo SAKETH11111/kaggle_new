@@ -1,4 +1,5 @@
-import pandas as pd
+import polars as pl
+import pandas as pd  # Keep for XGBoost/LightGBM interface
 import numpy as np
 from sklearn.model_selection import GroupShuffleSplit, StratifiedGroupKFold
 from sklearn.metrics import log_loss
@@ -34,7 +35,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configure tqdm for better progress bars
-tqdm.pandas(desc="Processing")
 
 # Define categorical features
 CAT_COLS = [
@@ -62,68 +62,11 @@ CAT_COLS = [
 logger.info("=" * 80)
 logger.info("Starting XGBoost Ranker Baseline for FlightRank 2025")
 logger.info("=" * 80)
-# Cache configuration
-CACHE_DIR = Path("data_cache")
-CACHE_VERSION = "v2.3"  
-ENABLE_CACHE = True
-
 # Core run-time parameters
 cpu_count = mp.cpu_count()
 N_JOBS = cpu_count
 target_ram_usage = 0.85
 TRAIN_SAMPLE_FRAC = 1.0
-
-def get_cache_key(*args):
-    """Generate a cache key from arguments."""
-    content = str(args) + CACHE_VERSION
-    return hashlib.md5(content.encode()).hexdigest()
-
-def save_to_cache(data, cache_key, cache_type="data"):
-    """Save data to cache with compression."""
-    if not ENABLE_CACHE:
-        return
-    
-    CACHE_DIR.mkdir(exist_ok=True)
-    cache_file = CACHE_DIR / f"{cache_type}_{cache_key}.pkl"
-    
-    try:
-        with open(cache_file, 'wb') as f:
-            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
-        
-        # Get file size for logging
-        size_mb = cache_file.stat().st_size / (1024 * 1024)
-        logger.info(f"Saved {cache_type} to cache: {cache_file.name} ({size_mb:.1f} MB)")
-    except Exception as e:
-        logger.warning(f"Failed to save cache: {e}")
-
-def load_from_cache(cache_key, cache_type="data"):
-    """Load data from cache."""
-    if not ENABLE_CACHE:
-        return None
-    
-    cache_file = CACHE_DIR / f"{cache_type}_{cache_key}.pkl"
-    
-    if not cache_file.exists():
-        return None
-    
-    try:
-        with open(cache_file, 'rb') as f:
-            data = pickle.load(f)
-        
-        # Get file size for logging
-        size_mb = cache_file.stat().st_size / (1024 * 1024)
-        logger.info(f"Loaded {cache_type} from cache: {cache_file.name} ({size_mb:.1f} MB) ⚡")
-        return data
-    except Exception as e:
-        logger.warning(f"Failed to load cache: {e}")
-        return None
-
-def clear_cache():
-    """Clear all cached data."""
-    if CACHE_DIR.exists():
-        for cache_file in CACHE_DIR.glob("*.pkl"):
-            cache_file.unlink()
-        logger.info("Cache cleared")
 
 # Global parameters with memory management
 TRAIN_SAMPLE_FRAC = 1.0  # Sample 10% of data for robust training
@@ -177,29 +120,16 @@ def monitor_memory():
 
 @timer
 def load_data():
-    """Load parquet files with caching"""
-    cache_key = get_cache_key("raw_data")
-    cached_data = load_from_cache(cache_key, "raw_data")
-    
-    if cached_data is not None:
-        train, test = cached_data
-        logger.info(f"Train shape: {train.shape}, Test shape: {test.shape}")
-        logger.info(f"Unique ranker_ids in train: {train['ranker_id'].nunique():,}")
-        logger.info(f"Selected rate: {train['selected'].mean():.3f}")
-        return train, test
-    
+    """Load parquet files using Polars"""
     logger.info("Loading data files...")
     with tqdm(total=2, desc="Loading files") as pbar:
-        train = pd.read_parquet('kaggle/input/train.parquet')
+        train = pl.read_parquet('kaggle/input/train.parquet')
         pbar.update(1)
-        test = pd.read_parquet('kaggle/input/test.parquet')
+        test = pl.read_parquet('kaggle/input/test.parquet')
         pbar.update(1)
-    
-    # Cache the raw data
-    save_to_cache((train, test), cache_key, "raw_data")
     
     logger.info(f"Train shape: {train.shape}, Test shape: {test.shape}")
-    logger.info(f"Unique ranker_ids in train: {train['ranker_id'].nunique():,}")
+    logger.info(f"Unique ranker_ids in train: {train['ranker_id'].n_unique():,}")
     logger.info(f"Selected rate: {train['selected'].mean():.3f}")
     
     return train, test
@@ -208,36 +138,44 @@ def load_data():
 train, test = load_data()
 
 @timer
-def optimize_memory(df: pd.DataFrame) -> pd.DataFrame:
+def optimize_memory(df: pl.DataFrame) -> pl.DataFrame:
     """
-    Downcast numeric columns to their most memory-efficient types.
+    Downcast numeric columns to their most memory-efficient types using Polars.
     """
     logger.info(f"Optimizing memory for dataframe with shape {df.shape}...")
-    start_mem = df.memory_usage().sum() / 1024**2
+    start_mem = df.estimated_size() / 1024**2
     
+    optimized_cols = []
     for col in df.columns:
         col_type = df[col].dtype
         
-        if col_type != object and not pd.api.types.is_datetime64_any_dtype(df[col]):
+        if col_type in [pl.Int64, pl.Int32, pl.Int16, pl.Int8]:
             c_min = df[col].min()
             c_max = df[col].max()
             
-            if str(col_type)[:3] == 'int':
-                if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
-                    df[col] = df[col].astype(np.int8)
-                elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
-                    df[col] = df[col].astype(np.int16)
-                elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
-                    df[col] = df[col].astype(np.int32)
-                elif c_min > np.iinfo(np.int64).min and c_max < np.iinfo(np.int64).max:
-                    df[col] = df[col].astype(np.int64)
+            if c_min >= np.iinfo(np.int8).min and c_max <= np.iinfo(np.int8).max:
+                optimized_cols.append(pl.col(col).cast(pl.Int8))
+            elif c_min >= np.iinfo(np.int16).min and c_max <= np.iinfo(np.int16).max:
+                optimized_cols.append(pl.col(col).cast(pl.Int16))
+            elif c_min >= np.iinfo(np.int32).min and c_max <= np.iinfo(np.int32).max:
+                optimized_cols.append(pl.col(col).cast(pl.Int32))
             else:
-                if c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
-                    df[col] = df[col].astype(np.float32)
-                else:
-                    df[col] = df[col].astype(np.float64)
+                optimized_cols.append(pl.col(col))
+        elif col_type in [pl.Float64, pl.Float32]:
+            c_min = df[col].min()
+            c_max = df[col].max()
+            
+            if c_min >= np.finfo(np.float32).min and c_max <= np.finfo(np.float32).max:
+                optimized_cols.append(pl.col(col).cast(pl.Float32))
+            else:
+                optimized_cols.append(pl.col(col))
+        else:
+            optimized_cols.append(pl.col(col))
+    
+    if optimized_cols:
+        df = df.with_columns(optimized_cols)
                     
-    end_mem = df.memory_usage().sum() / 1024**2
+    end_mem = df.estimated_size() / 1024**2
     reduction = 100 * (start_mem - end_mem) / start_mem
     logger.info(f"Memory usage reduced from {start_mem:.2f} MB to {end_mem:.2f} MB ({reduction:.1f}% reduction)")
     return df
@@ -253,7 +191,7 @@ def sample_data(train, sample_frac):
         return train
         
     logger.info(f"Sampling {sample_frac*100}% of training data by ranker_id...")
-    unique_rankers = train['ranker_id'].unique()
+    unique_rankers = train['ranker_id'].unique().to_numpy()
     n_sample = int(len(unique_rankers) * sample_frac)
     
     with tqdm(desc="Sampling data") as pbar:
@@ -262,10 +200,10 @@ def sample_data(train, sample_frac):
         )
         pbar.update(50)
         
-        train_sampled = train[train['ranker_id'].isin(sampled_rankers)]
+        train_sampled = train.filter(pl.col('ranker_id').is_in(sampled_rankers))
         pbar.update(50)
     
-    logger.info(f"Sampled train to {len(train_sampled):,} rows ({train_sampled['ranker_id'].nunique():,} groups)")
+    logger.info(f"Sampled train to {len(train_sampled):,} rows ({train_sampled['ranker_id'].n_unique():,} groups)")
     return train_sampled
 
 # Sample by ranker_id to keep groups intact
@@ -278,7 +216,7 @@ def convert_ranker_ids(train, test):
     
     def convert_df(df, desc):
         with tqdm(desc=desc) as pbar:
-            df['ranker_id'] = df['ranker_id'].astype(str)
+            df = df.with_columns(pl.col('ranker_id').cast(pl.Utf8))
             pbar.update(100)
         return df
     
@@ -298,35 +236,42 @@ def process_duration_chunk(chunk_data):
     """Process duration columns for a chunk of data"""
     chunk, dur_cols = chunk_data
     
-    def hms_to_minutes(s: pd.Series) -> np.ndarray:
-        """Vectorised 'HH:MM:SS' → minutes (seconds ignored)."""
-        mask = s.notna()
-        out = np.zeros(len(s), dtype=float)
-        if mask.any():
-            # Use string accessor on the Series directly, which is more robust
-            s_str = s[mask].astype(str)
-            parts = s_str.str.split(':', expand=True)
-            
-            # Convert parts to numeric, ensuring proper handling
-            hours = pd.to_numeric(parts[0], errors="coerce").fillna(0)
-            minutes = pd.to_numeric(parts[1], errors="coerce").fillna(0)
-            
-            out[mask] = (hours.astype(float) * 60 + minutes.astype(float))
-        return out
+    def hms_to_minutes_polars(col_name):
+        """Convert 'HH:MM:SS' to minutes using Polars expressions."""
+        return (
+            pl.col(col_name)
+            .str.split(":")
+            .list.eval(
+                pl.element().cast(pl.Float64, strict=False).fill_null(0)
+            )
+            .list.eval(
+                pl.when(pl.int_range(pl.len()) == 0)
+                .then(pl.element() * 60)
+                .when(pl.int_range(pl.len()) == 1)
+                .then(pl.element())
+                .otherwise(0)
+            )
+            .list.sum()
+            .fill_null(0)
+        )
     
+    duration_exprs = []
     for col in dur_cols:
         if col in chunk.columns:
-            chunk[col] = hms_to_minutes(chunk[col])
+            duration_exprs.append(hms_to_minutes_polars(col).alias(col))
+    
+    if duration_exprs:
+        chunk = chunk.with_columns(duration_exprs)
     
     return chunk
 
-def create_features(df: pd.DataFrame) -> pd.DataFrame:
+def create_features(df: pl.DataFrame) -> pl.DataFrame:
     """
     Return a copy of df enriched with engineered features.
     Uses parallel processing for intensive operations.
     """
     logger.info(f"Starting feature engineering for dataset with shape {df.shape}")
-    df = df.copy()
+    df = df.clone()
 
     # Process duration columns in parallel chunks
     logger.info("Processing duration columns in parallel...")
@@ -349,7 +294,7 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
     
     # Split dataframe into more chunks for better parallelization
     chunk_size = max(500, len(df) // (effective_jobs * 2))  # Smaller chunks for better distribution
-    chunks = [df.iloc[i:i+chunk_size].copy() for i in range(0, len(df), chunk_size)]
+    chunks = [df.slice(i, chunk_size) for i in range(0, len(df), chunk_size)]
     chunk_data = [(chunk, dur_cols) for chunk in chunks]
     
     with ProcessPoolExecutor(max_workers=effective_jobs) as executor:
@@ -360,7 +305,7 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
                 pbar.update(1)
     
     # Combine processed chunks
-    df = pd.concat(processed_chunks, ignore_index=True)
+    df = pl.concat(processed_chunks)
 
     logger.info("Creating price and duration features...")
     # Feature container
@@ -377,12 +322,14 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
 
     with tqdm(desc="Duration features", total=2) as pbar:
         # Duration features
-        df["total_duration"] = df["legs0_duration"].fillna(0) + df["legs1_duration"].fillna(0)
+        df = df.with_columns([
+            (pl.col("legs0_duration").fill_null(0) + pl.col("legs1_duration").fill_null(0)).alias("total_duration")
+        ])
         pbar.update(1)
-        feat["duration_ratio"] = np.where(
-            df["legs1_duration"].fillna(0) > 0,
-            df["legs0_duration"] / (df["legs1_duration"] + 1),
-            1.0,
+        feat["duration_ratio"] = (
+            pl.when(pl.col("legs1_duration").fill_null(0) > 0)
+            .then(pl.col("legs0_duration") / (pl.col("legs1_duration") + 1))
+            .otherwise(1.0)
         )
         pbar.update(1)
 
@@ -390,71 +337,70 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
     # Fix segment count features
     with tqdm(desc="Segment counts", total=2) as pbar:
         for leg in (0, 1):
-            seg_count = 0
+            seg_count_expr = pl.lit(0)
             for seg in range(4):  # Check up to 4 segments
                 col = f"legs{leg}_segments{seg}_duration"
                 if col in df.columns:
-                    seg_count += df[col].notna().astype(int)
+                    seg_count_expr = seg_count_expr + pl.col(col).is_not_null().cast(pl.Int32)
                 else:
                     break
-            feat[f"n_segments_leg{leg}"] = seg_count
+            feat[f"n_segments_leg{leg}"] = seg_count_expr
             pbar.update(1)
 
     feat["total_segments"] = feat["n_segments_leg0"] + feat["n_segments_leg1"]
 
     # High-impact features from notebook
     mc_exists = [f'legs{l}_segments{s}_marketingCarrier_code' for l in (0, 1) for s in range(4) if f'legs{l}_segments{s}_marketingCarrier_code' in df.columns]
-    feat["l0_seg"] = df[mc_exists].notna().sum(axis=1)
+    if mc_exists:
+        feat["l0_seg"] = pl.sum_horizontal([pl.col(col).is_not_null().cast(pl.Int32) for col in mc_exists])
+    else:
+        feat["l0_seg"] = pl.lit(0)
 
     logger.info("Detecting trip types...")
     with tqdm(desc="Trip types", total=2) as pbar:
         # Fix trip type detection
         feat["is_one_way"] = (
-            df["legs1_duration"].isna() | 
-            (df["legs1_duration"] == 0) |
-            df["legs1_segments0_departureFrom_airport_iata"].isna()
-        ).astype(int)
+            pl.col("legs1_duration").is_null() | 
+            (pl.col("legs1_duration") == 0) |
+            pl.col("legs1_segments0_departureFrom_airport_iata").is_null()
+        ).cast(pl.Int32)
         pbar.update(1)
         
-        feat["has_return"] = (1 - feat["is_one_way"]).astype(int)
+        feat["has_return"] = (1 - feat["is_one_way"]).cast(pl.Int32)
         pbar.update(1)
 
     logger.info("Creating 'days-out' feature...")
     with tqdm(desc="Days-out feature", total=1) as pbar:
-        request_dt = pd.to_datetime(df['requestDate'], errors='coerce')
-        departure_dt = pd.to_datetime(df['legs0_departureAt'], errors='coerce')
-        
-        # Calculate the difference in days
-        days_out = (departure_dt - request_dt).dt.days
-        feat['days_out'] = days_out
+        feat['days_out'] = (
+            pl.col('legs0_departureAt').str.strptime(pl.Date, format="%Y-%m-%d", strict=False) -
+            pl.col('requestDate').str.strptime(pl.Date, format="%Y-%m-%d", strict=False)
+        ).dt.total_days()
         pbar.update(1)
 
     logger.info("Creating ranking features...")
-    # Optimize ranking features with parallel computation
-    grp = df.groupby("ranker_id")
+    # Optimize ranking features with parallel computation using Polars window functions
     
     def compute_ranking_features():
-        # Vectorized calculations for speed
+        # Vectorized calculations for speed using Polars window functions
         with tqdm(desc="Ranking features (vectorized)", total=6) as pbar:
-            price_ranks = grp["totalPrice"].rank()
+            price_ranks = pl.col("totalPrice").rank().over("ranker_id")
             pbar.update(1)
-            price_pct_ranks = grp["totalPrice"].rank(pct=True)
+            price_pct_ranks = pl.col("totalPrice").rank() / pl.col("totalPrice").count().over("ranker_id")
             pbar.update(1)
-            duration_ranks = grp["total_duration"].rank()
-            pbar.update(1)
-            
-            price_min = grp["totalPrice"].transform("min")
-            is_cheapest = (price_min == df["totalPrice"]).astype(int)
+            duration_ranks = pl.col("total_duration").rank().over("ranker_id")
             pbar.update(1)
             
-            price_max = grp["totalPrice"].transform("max")
-            is_most_expensive = (price_max == df["totalPrice"]).astype(int)
+            is_cheapest = (pl.col("totalPrice") == pl.col("totalPrice").min().over("ranker_id")).cast(pl.Int32)
+            pbar.update(1)
+            
+            is_most_expensive = (pl.col("totalPrice") == pl.col("totalPrice").max().over("ranker_id")).cast(pl.Int32)
             pbar.update(1)
 
-            # Optimized median/std calculation, replacing slow lambda function
-            medians = grp["totalPrice"].transform("median")
-            stds = grp["totalPrice"].transform("std")
-            price_from_median = (df["totalPrice"] - medians) / (stds + 1)
+            # Optimized median/std calculation
+            price_from_median = (
+                (pl.col("totalPrice") - pl.col("totalPrice").median().over("ranker_id")) / 
+                (pl.col("totalPrice").std().over("ranker_id") + 1)
+            )
             pbar.update(1)
 
         return {
@@ -471,15 +417,17 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
 
     logger.info("Processing frequent flyer data...")
     # Frequent-flyer features - only for airlines actually present in data
-    ff = df["frequentFlyer"].fillna("").astype(str)
-    feat["n_ff_programs"] = ff.str.count("/") + (ff != "")
+    feat["n_ff_programs"] = (
+        pl.col("frequentFlyer").fill_null("").str.count_matches("/") + 
+        (pl.col("frequentFlyer").fill_null("") != "").cast(pl.Int32)
+    )
 
     # Check which airlines are actually in the data
     carrier_cols = ["legs0_segments0_marketingCarrier_code", "legs1_segments0_marketingCarrier_code"]
     present_airlines = set()
     for col in carrier_cols:
         if col in df.columns:
-            present_airlines.update(df[col].dropna().unique())
+            present_airlines.update(df[col].drop_nulls().unique().to_list())
 
     logger.info(f"Airlines present in data: {sorted(present_airlines)}")
 
@@ -487,41 +435,42 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
     with tqdm(desc="FF features", total=4) as pbar:
         for al in ["SU", "S7", "U6", "TK"]:  # Keep only major Russian/Turkish airlines
             if al in present_airlines:
-                feat[f"ff_{al}"] = ff.str.contains(rf"\b{al}\b").astype(int)
+                feat[f"ff_{al}"] = pl.col("frequentFlyer").fill_null("").str.contains(rf"\b{al}\b").cast(pl.Int32)
             pbar.update(1)
 
     # Check if FF matches carrier
-    feat["ff_matches_carrier"] = 0
+    ff_matches_expr = pl.lit(0)
     for al in ["SU", "S7", "U6", "TK"]:
         if f"ff_{al}" in feat and "legs0_segments0_marketingCarrier_code" in df.columns:
-            feat["ff_matches_carrier"] |= (
-                (feat.get(f"ff_{al}", 0) == 1) & 
-                (df["legs0_segments0_marketingCarrier_code"] == al)
-            ).astype(int)
+            ff_matches_expr = ff_matches_expr | (
+                (feat.get(f"ff_{al}", pl.lit(0)) == 1) & 
+                (pl.col("legs0_segments0_marketingCarrier_code") == al)
+            ).cast(pl.Int32)
+    feat["ff_matches_carrier"] = ff_matches_expr
 
     logger.info("Creating binary flag features...")
-    with tqdm(desc="Binary flags", total=8) as pbar:
+    with tqdm(desc="Binary flags", total=7) as pbar:
         # Binary flags
-        feat["is_vip_freq"] = ((df["isVip"] == 1) | (feat["n_ff_programs"] > 0)).astype(int)
+        feat["is_vip_freq"] = ((pl.col("isVip") == 1) | (feat["n_ff_programs"] > 0)).cast(pl.Int32)
         pbar.update(1)
-        feat["has_corporate_tariff"] = (~df["corporateTariffCode"].isna()).astype(int)
+        feat["has_corporate_tariff"] = pl.col("corporateTariffCode").is_not_null().cast(pl.Int32)
         pbar.update(1)
 
         # Baggage and fees
         feat["baggage_total"] = (
-            df["legs0_segments0_baggageAllowance_quantity"].fillna(0)
-            + df["legs1_segments0_baggageAllowance_quantity"].fillna(0)
+            pl.col("legs0_segments0_baggageAllowance_quantity").fill_null(0) +
+            pl.col("legs1_segments0_baggageAllowance_quantity").fill_null(0)
         )
         pbar.update(1)
-        feat["has_baggage"] = (feat["baggage_total"] > 0).astype(int)
+        feat["has_baggage"] = (feat["baggage_total"] > 0).cast(pl.Int32)
         pbar.update(1)
         feat["total_fees"] = (
-            df["miniRules0_monetaryAmount"].fillna(0) + df["miniRules1_monetaryAmount"].fillna(0)
+            pl.col("miniRules0_monetaryAmount").fill_null(0) + pl.col("miniRules1_monetaryAmount").fill_null(0)
         )
         pbar.update(1)
-        feat["has_fees"] = (feat["total_fees"] > 0).astype(int)
+        feat["has_fees"] = (feat["total_fees"] > 0).cast(pl.Int32)
         pbar.update(1)
-        feat["fee_rate"] = feat["total_fees"] / (df["totalPrice"] + 1)
+        feat["fee_rate"] = feat["total_fees"] / (pl.col("totalPrice") + 1)
         pbar.update(1)
 
     logger.info("Creating time-of-day features...")
@@ -530,125 +479,114 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
     with tqdm(desc="Time features", total=len(time_cols)) as pbar:
         for col in time_cols:
             if col in df.columns:
-                dt = pd.to_datetime(df[col], errors="coerce")
-                feat[f"{col}_hour"] = dt.dt.hour.fillna(12)
-                feat[f"{col}_weekday"] = dt.dt.weekday.fillna(0)
-                h = dt.dt.hour.fillna(12)
-                feat[f"{col}_business_time"] = (((6 <= h) & (h <= 9)) | ((17 <= h) & (h <= 20))).astype(int)
+                dt_col = pl.col(col).str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S", strict=False)
+                feat[f"{col}_hour"] = dt_col.dt.hour().fill_null(12)
+                feat[f"{col}_weekday"] = dt_col.dt.weekday().fill_null(0)
+                h = dt_col.dt.hour().fill_null(12)
+                feat[f"{col}_business_time"] = (((6 <= h) & (h <= 9)) | ((17 <= h) & (h <= 20))).cast(pl.Int32)
             pbar.update(1)
 
     logger.info("Processing direct flight features...")
     with tqdm(desc="Direct flight features", total=4) as pbar:
         # Fix direct flight detection
-        feat["is_direct_leg0"] = (feat["n_segments_leg0"] == 1).astype(int)
+        feat["is_direct_leg0"] = (feat["n_segments_leg0"] == 1).cast(pl.Int32)
         pbar.update(1)
-        feat["is_direct_leg1"] = np.where(
-            feat["is_one_way"] == 1,
-            0,  # One-way flights don't have leg1
-            (feat["n_segments_leg1"] == 1).astype(int)
-        )
+        feat["is_direct_leg1"] = pl.when(feat["is_one_way"] == 1).then(0).otherwise((feat["n_segments_leg1"] == 1).cast(pl.Int32))
         pbar.update(1)
-        feat["both_direct"] = (feat["is_direct_leg0"] & feat["is_direct_leg1"]).astype(int)
+        feat["both_direct"] = (feat["is_direct_leg0"] & feat["is_direct_leg1"]).cast(pl.Int32)
         pbar.update(1)
 
-        # Cheapest direct flight
-        df["_is_direct"] = feat["is_direct_leg0"] == 1
-        direct_groups = df[df["_is_direct"]].groupby("ranker_id")["totalPrice"]
-        if len(direct_groups) > 0:
-            direct_min_price = direct_groups.min()
-            # Use .to_dict() to resolve potential map ambiguity for the linter
-            min_price_map = direct_min_price.to_dict()
-            # Use a lambda to ensure mapping is correctly interpreted
-            feat["is_direct_cheapest"] = (
-                df["_is_direct"] & 
-                (df["totalPrice"] == df["ranker_id"].map(lambda r: min_price_map.get(r)))
-            ).astype(int)
-        else:
-            feat["is_direct_cheapest"] = 0
-        df.drop(columns="_is_direct", inplace=True)
+        # Cheapest direct flight - using window functions
+        feat["is_direct_cheapest"] = (
+            (feat["is_direct_leg0"] == 1) & 
+            (pl.col("totalPrice") == pl.col("totalPrice").filter(feat["is_direct_leg0"] == 1).min().over("ranker_id"))
+        ).cast(pl.Int32)
         pbar.update(1)
 
     logger.info("Creating miscellaneous features...")
     with tqdm(desc="Misc features", total=7) as pbar:
         # Other features
-        feat["has_access_tp"] = (df["pricingInfo_isAccessTP"] == 1).astype(int)
+        feat["has_access_tp"] = (pl.col("pricingInfo_isAccessTP") == 1).cast(pl.Int32)
         pbar.update(1)
-        feat["group_size"] = df.groupby("ranker_id")["Id"].transform("count")
+        feat["group_size"] = pl.col("Id").count().over("ranker_id")
         pbar.update(1)
-        feat["group_size_log"] = np.log1p(feat["group_size"])
+        feat["group_size_log"] = (feat["group_size"] + 1).log()
         pbar.update(1)
 
         # Check if major carrier
         if "legs0_segments0_marketingCarrier_code" in df.columns:
-            feat["is_major_carrier"] = df["legs0_segments0_marketingCarrier_code"].isin(["SU", "S7", "U6"]).astype(int)
+            feat["is_major_carrier"] = pl.col("legs0_segments0_marketingCarrier_code").is_in(["SU", "S7", "U6"]).cast(pl.Int32)
         else:
-            feat["is_major_carrier"] = 0
+            feat["is_major_carrier"] = pl.lit(0)
         pbar.update(1)
 
         # Popular routes
         popular_routes = ["MOWLED/LEDMOW", "LEDMOW/MOWLED", "MOWLED", "LEDMOW", "MOWAER/AERMOW"]
-        feat["is_popular_route"] = df["searchRoute"].isin(popular_routes).astype(int)
+        feat["is_popular_route"] = pl.col("searchRoute").is_in(popular_routes).cast(pl.Int32)
         pbar.update(1)
 
         # Cabin class features
-        feat["avg_cabin_class"] = df[["legs0_segments0_cabinClass", "legs1_segments0_cabinClass"]].mean(axis=1)
+        feat["avg_cabin_class"] = (pl.col("legs0_segments0_cabinClass") + pl.col("legs1_segments0_cabinClass")) / 2
         pbar.update(1)
         feat["cabin_class_diff"] = (
-            df["legs0_segments0_cabinClass"].fillna(0) - df["legs1_segments0_cabinClass"].fillna(0)
+            pl.col("legs0_segments0_cabinClass").fill_null(0) - pl.col("legs1_segments0_cabinClass").fill_null(0)
         )
         pbar.update(1)
 
     logger.info("Creating interaction features...")
     with tqdm(desc="Interaction features", total=2) as pbar:
-        feat["price_per_dur"] = df["totalPrice"] / (df["total_duration"] + 1)
+        feat["price_per_dur"] = pl.col("totalPrice") / (pl.col("total_duration") + 1)
         pbar.update(1)
-        feat["policy_violation"] = (~feat["has_access_tp"].astype(bool)).astype(int) * feat["has_return"]
+        feat["policy_violation"] = (feat["has_access_tp"] == 0).cast(pl.Int32) * feat["has_return"]
         pbar.update(1)
 
     logger.info("Merging engineered features...")
-    # Merge new features
+    # Merge new features using Polars with_columns
     with tqdm(desc="Merging features") as pbar:
-        df = pd.concat([df, pd.DataFrame(feat, index=df.index)], axis=1)
+        feature_exprs = []
+        for name, expr in feat.items():
+            if isinstance(expr, (int, float)):
+                feature_exprs.append(pl.lit(expr).alias(name))
+            else:
+                feature_exprs.append(expr.alias(name))
+        df = df.with_columns(feature_exprs)
         pbar.update(100)
 
     # is_min_segments feature
-    grp = df.groupby("ranker_id")["l0_seg"]
-    df["is_min_segments"] = (df["l0_seg"] == grp.transform("min")).astype(int)
+    df = df.with_columns([
+        (pl.col("l0_seg") == pl.col("l0_seg").min().over("ranker_id")).cast(pl.Int32).alias("is_min_segments")
+    ])
 
     logger.info("Handling NaN values...")
-    # Final NaN handling
-    numeric_cols = df.select_dtypes(include="number").columns
-    object_cols = df.select_dtypes(include="object").columns
-    
+    # Final NaN handling using Polars
     with tqdm(desc="Filling NaN values", total=2) as pbar:
-        for col in numeric_cols:
-            df[col] = df[col].fillna(0)
+        numeric_exprs = []
+        for col in df.columns:
+            if df[col].dtype in [pl.Float32, pl.Float64, pl.Int8, pl.Int16, pl.Int32, pl.Int64]:
+                numeric_exprs.append(pl.col(col).fill_null(0))
+        if numeric_exprs:
+            df = df.with_columns(numeric_exprs)
         pbar.update(1)
         
-        for col in object_cols:
-            df[col] = df[col].fillna("missing")
+        string_exprs = []
+        for col in df.columns:
+            if df[col].dtype == pl.Utf8:
+                string_exprs.append(pl.col(col).fill_null("missing"))
+        if string_exprs:
+            df = df.with_columns(string_exprs)
         pbar.update(1)
 
     logger.info(f"Feature engineering complete. Final shape: {df.shape}")
     return df
 
-# Apply feature engineering with caching
+# Apply feature engineering without caching
 logger.info("Applying feature engineering...")
-cache_key = get_cache_key("features", TRAIN_SAMPLE_FRAC)
-cached_features = load_from_cache(cache_key, "features")
-
-if cached_features is not None:
-    train, test = cached_features
-else:
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        future_train = executor.submit(create_features, train)
-        future_test = executor.submit(create_features, test)
-        
-        train = future_train.result()
-        test = future_test.result()
+with ThreadPoolExecutor(max_workers=2) as executor:
+    future_train = executor.submit(create_features, train)
+    future_test = executor.submit(create_features, test)
     
-    # Cache the processed features
-    save_to_cache((train, test), cache_key, "features")
+    train = future_train.result()
+    test = future_test.result()
 
 
 logger.info("Defining columns to exclude...")
@@ -685,22 +623,15 @@ logger.info(f"Using {len(feature_cols)} features ({len(cat_features_final)} cate
 
 @timer
 def prepare_data():
-    """Prepare training data with caching"""
-    cache_key = get_cache_key("prepared_data", len(feature_cols), TRAIN_SAMPLE_FRAC)
-    cached_data = load_from_cache(cache_key, "prepared")
-    
-    if cached_data is not None:
-        logger.info("Loaded prepared data from cache")
-        return cached_data
-    
+    """Prepare training data without caching"""
     logger.info("Preparing training data...")
     
     # Parallel data extraction
     def extract_train_data():
-        return train[feature_cols], train['selected'], train['ranker_id']
+        return train.select(feature_cols), train['selected'], train['ranker_id']
     
     def extract_test_data():
-        return test[feature_cols], test['ranker_id']
+        return test.select(feature_cols), test['ranker_id']
     
     with ThreadPoolExecutor(max_workers=2) as executor:
         with tqdm(desc="Data preparation", total=2) as pbar:
@@ -715,25 +646,13 @@ def prepare_data():
     
     result = (X_train, y_train, groups_train, X_test, groups_test)
     
-    # Cache the prepared data
-    save_to_cache(result, cache_key, "prepared")
-    
     return result
 
 X_train, y_train, groups_train, X_test, groups_test = prepare_data()
 
 @timer
 def perform_train_val_split(X_train, y_train, groups_train, train_df):
-    """Perform stratified group-based k-fold cross-validation with caching."""
-    cache_key = get_cache_key("cv_folds", len(X_train), RANDOM_STATE)
-    cached_folds = load_from_cache(cache_key, "cv_folds")
-    
-    if cached_folds is not None:
-        logger.info("Loaded CV folds from cache")
-        for fold, (train_idx, val_idx) in enumerate(cached_folds):
-            logger.info(f"Fold {fold+1}: Train size={len(train_idx)}, Val size={len(val_idx)}")
-        return cached_folds
-    
+    """Perform stratified group-based k-fold cross-validation without caching."""
     logger.info("Performing 5-fold stratified group cross-validation...")
     
     # Ensure 'has_return' is available for stratification
@@ -742,17 +661,20 @@ def perform_train_val_split(X_train, y_train, groups_train, train_df):
         
     skf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
     
+    # Convert Polars to pandas for sklearn compatibility
+    X_train_pd = X_train.to_pandas()
+    y_train_pd = y_train.to_pandas()
+    groups_train_pd = groups_train.to_pandas()
+    train_df_pd = train_df.to_pandas()
+    
     # The stratification is done on 'has_return'
-    stratify_on = train_df.loc[X_train.index]['has_return']
+    stratify_on = train_df_pd.loc[X_train_pd.index]['has_return']
     
     # Store indices for each fold
     folds = []
-    for fold, (train_idx, val_idx) in enumerate(skf.split(X_train, stratify_on, groups=groups_train)):
+    for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_pd, stratify_on, groups=groups_train_pd)):
         folds.append((train_idx, val_idx))
         logger.info(f"Fold {fold+1}: Train size={len(train_idx)}, Val size={len(val_idx)}")
-    
-    # Cache the folds
-    save_to_cache(folds, cache_key, "cv_folds")
         
     return folds
 
@@ -845,13 +767,17 @@ for fold_num, (train_idx, val_idx) in enumerate(folds):
         logger.info("Garbage collection completed")
         monitor_memory()
     
-    # Split data for this fold, resetting indices to prevent alignment issues
-    X_tr = X_train.iloc[train_idx].reset_index(drop=True)
-    X_val = X_train.iloc[val_idx].reset_index(drop=True)
-    y_tr = y_train.iloc[train_idx].reset_index(drop=True)
-    y_val = y_train.iloc[val_idx].reset_index(drop=True)
-    groups_tr = groups_train.iloc[train_idx].reset_index(drop=True)
-    groups_val = groups_train.iloc[val_idx].reset_index(drop=True)
+    # Split data for this fold - convert to pandas for model compatibility
+    X_train_pd = X_train.to_pandas()
+    y_train_pd = y_train.to_pandas()
+    groups_train_pd = groups_train.to_pandas()
+    
+    X_tr = X_train_pd.iloc[train_idx].reset_index(drop=True)
+    X_val = X_train_pd.iloc[val_idx].reset_index(drop=True)
+    y_tr = y_train_pd.iloc[train_idx].reset_index(drop=True)
+    y_val = y_train_pd.iloc[val_idx].reset_index(drop=True)
+    groups_tr = groups_train_pd.iloc[train_idx].reset_index(drop=True)
+    groups_val = groups_train_pd.iloc[val_idx].reset_index(drop=True)
     
     logger.info(f"Fold {fold_num+1}: Train size={len(X_tr)}, Val size={len(X_val)}")
 
@@ -906,20 +832,24 @@ logger.info(f"\nTraining final {MODEL_TO_RUN.upper()} model on full training dat
 
 # 1. Encode categorical features for the full training and test sets using TargetEncoder
 logger.info("Target encoding categorical features for final model...")
-X_train_final = X_train.copy()
-X_test_final = X_test.copy()
+X_train_final = X_train.to_pandas().copy()
+X_test_final = X_test.to_pandas().copy()
+y_train_pd = y_train.to_pandas()
 
 final_target_encoder = ce.TargetEncoder(cols=cat_features_final, handle_unknown='value', handle_missing='value')
-X_train_final[cat_features_final] = final_target_encoder.fit_transform(X_train_final[cat_features_final], y_train)
+X_train_final[cat_features_final] = final_target_encoder.fit_transform(X_train_final[cat_features_final], y_train_pd)
 X_test_final[cat_features_final] = final_target_encoder.transform(X_test_final[cat_features_final])
 
 # 2. Train the final model
 best_iteration = int(np.mean([model.best_iteration for model in fold_models]))
 logger.info(f"Training final model for {best_iteration} rounds...")
 
+groups_train_pd = groups_train.to_pandas()
+y_train_pd = y_train.to_pandas()
+
 if MODEL_TO_RUN == 'xgb':
-    group_sizes_train_final = groups_train.value_counts().sort_index().values
-    dtrain_final = xgb.DMatrix(X_train_final, label=y_train, group=group_sizes_train_final)
+    group_sizes_train_final = groups_train_pd.value_counts().sort_index().values
+    dtrain_final = xgb.DMatrix(X_train_final, label=y_train_pd, group=group_sizes_train_final)
     final_model = xgb.train(
         model_params,
         dtrain_final,
@@ -927,10 +857,10 @@ if MODEL_TO_RUN == 'xgb':
         verbose_eval=50
     )
 elif MODEL_TO_RUN == 'lgb':
-    group_sizes_train_final = groups_train.value_counts().sort_index()
+    group_sizes_train_final = groups_train_pd.value_counts().sort_index()
     dtrain_final = lgb.Dataset(
         X_train_final,
-        label=y_train,
+        label=y_train_pd,
         group=group_sizes_train_final,
         categorical_feature=cat_features_final
     )
@@ -947,8 +877,10 @@ def generate_test_predictions(final_model, X_test_final, test_df):
     """Generate predictions for test set"""
     logger.info("Generating test predictions...")
     
+    test_df_pd = test_df.to_pandas()
+    
     if MODEL_TO_RUN == 'xgb':
-        group_sizes_test = test_df.groupby('ranker_id').size().values
+        group_sizes_test = test_df_pd.groupby('ranker_id').size().values
         dtest = xgb.DMatrix(X_test_final, group=group_sizes_test)
         test_preds = final_model.predict(dtest)
     elif MODEL_TO_RUN == 'lgb':
@@ -963,8 +895,10 @@ def create_submission(test_df, test_preds):
     """Create submission file"""
     logger.info("Creating submission file...")
     
+    test_df_pd = test_df.to_pandas()
+    
     with tqdm(desc="Creating submission", total=3) as pbar:
-        submission = test_df[['Id', 'ranker_id']].copy()
+        submission = test_df_pd[['Id', 'ranker_id']].copy()
         pbar.update(1)
         submission['pred_score'] = test_preds
         pbar.update(1)
